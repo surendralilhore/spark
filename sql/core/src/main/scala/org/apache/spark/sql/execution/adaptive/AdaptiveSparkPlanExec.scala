@@ -623,13 +623,41 @@ case class AdaptiveSparkPlanExec(
       }
 
     case i: InMemoryTableScanLike =>
-      // There is no reuse for `InMemoryTableScanLike`, which is different from `Exchange`.
-      // If we hit it the first time, we should always create a new query stage.
-      val newStage = newQueryStage(i)
-      CreateStageResult(
-        newPlan = newStage,
-        allChildStagesMaterialized = false,
-        newStages = Seq(newStage))
+      if (i.isMaterialized) {
+        // Cache is already populated. Inline the scan into the parent stage instead of
+        // creating a separate TableCacheQueryStageExec. This matches Spark 3.4 behavior
+        // where InMemoryTableScan is part of the parent exchange stage, preserving exchange
+        // reuse and avoiding extra stages/tasks/bytes.
+        logDebug(s"InMemoryTableScan already materialized, inlining into parent stage")
+        CreateStageResult(
+          newPlan = i,
+          allChildStagesMaterialized = true,
+          newStages = Seq.empty)
+      } else {
+        // Cache not yet populated — need a separate stage to materialize it.
+        // Check the tableCacheStageCache for reuse of an existing stage for the same scan.
+        context.tableCacheStageCache.get(i.canonicalized) match {
+          case Some(existingStage) =>
+            val reuseStage = reuseTableCacheQueryStage(existingStage, i)
+            val isMaterialized = reuseStage.isMaterialized
+            logDebug(s"Reusing table cache query stage ${existingStage.id} " +
+              s"(materialized=$isMaterialized) as new stage ${reuseStage.id}")
+            CreateStageResult(
+              newPlan = reuseStage,
+              allChildStagesMaterialized = isMaterialized,
+              newStages = Seq.empty)
+
+          case _ =>
+            val newStage = newQueryStage(i).asInstanceOf[TableCacheQueryStageExec]
+            context.tableCacheStageCache.getOrElseUpdate(
+              newStage.plan.canonicalized, newStage)
+            logDebug(s"Created new table cache query stage ${newStage.id}")
+            CreateStageResult(
+              newPlan = newStage,
+              allChildStagesMaterialized = false,
+              newStages = Seq(newStage))
+        }
+      }
 
     case q: QueryStageExec =>
       assertStageNotFailed(q)
@@ -707,6 +735,23 @@ case class AdaptiveSparkPlanExec(
     currentStageId += 1
     setLogicalLinkForNewQueryStage(queryStage, exchange)
     queryStage
+  }
+
+  /**
+   * Create a reuse instance of a [[TableCacheQueryStageExec]] that shares materialization state
+   * with the existing stage. This avoids duplicate cache scans when the same
+   * [[InMemoryTableScanLike]] appears multiple times in the plan (e.g., multi-output writes).
+   * The new stage keeps its own plan for correct output attribute matching, but shares
+   * [[_resultOption]] and [[_error]] so it appears materialized when the original completes.
+   */
+  private def reuseTableCacheQueryStage(
+      existing: TableCacheQueryStageExec,
+      scan: InMemoryTableScanLike): TableCacheQueryStageExec = {
+    val newPlan = optimizeQueryStage(scan.asInstanceOf[SparkPlan], isFinalStage = false)
+    val newStage = existing.newReuseInstance(currentStageId, newPlan)
+    currentStageId += 1
+    setLogicalLinkForNewQueryStage(newStage, scan.asInstanceOf[SparkPlan])
+    newStage
   }
 
   /**
@@ -959,6 +1004,14 @@ case class AdaptiveExecutionContext(session: SparkSession, qe: QueryExecution) {
    */
   val stageCache: TrieMap[SparkPlan, ExchangeQueryStageExec] =
     new TrieMap[SparkPlan, ExchangeQueryStageExec]()
+
+  /**
+   * The table-cache-stage-reuse map shared across the entire query, including sub-queries.
+   * Prevents duplicate TableCacheQueryStageExec instances for the same InMemoryTableScan,
+   * which avoids redundant data reads and improves exchange reuse above cached table scans.
+   */
+  val tableCacheStageCache: TrieMap[SparkPlan, TableCacheQueryStageExec] =
+    new TrieMap[SparkPlan, TableCacheQueryStageExec]()
 
   val shuffleIds: ConcurrentHashMap[Int, Boolean] = new ConcurrentHashMap[Int, Boolean]()
 }

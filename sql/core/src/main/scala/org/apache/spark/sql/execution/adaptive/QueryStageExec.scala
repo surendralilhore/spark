@@ -310,6 +310,27 @@ case class TableCacheQueryStageExec(
   override protected def doMaterialize(): Future[Any] = future
 
   override def getRuntimeStatistics: Statistics = inMemoryTableScan.runtimeStatistics
+
+  /**
+   * This is needed to properly support exchange reuse when InMemoryTableScanExec is below exchange.
+   * Without this override, the unique stage ID would be included in canonicalized form, preventing
+   * exchanges from being reused.
+   */
+  override def doCanonicalize(): SparkPlan = plan.canonicalized
+
+  /**
+   * Create a reuse instance that shares materialization state with this stage.
+   * The new stage keeps its own plan for correct output attribute matching,
+   * but shares [[_resultOption]] and [[_error]] so it appears materialized
+   * when the original completes. This avoids duplicate cache scans when the
+   * same InMemoryTableScan appears multiple times in the plan.
+   */
+  def newReuseInstance(newStageId: Int, newPlan: SparkPlan): TableCacheQueryStageExec = {
+    val reuse = TableCacheQueryStageExec(newStageId, newPlan)
+    reuse._resultOption = this._resultOption
+    reuse._error = this._error
+    reuse
+  }
 }
 
 case class ResultQueryStageExec(
