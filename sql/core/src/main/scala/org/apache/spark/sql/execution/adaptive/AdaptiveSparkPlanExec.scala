@@ -623,40 +623,39 @@ case class AdaptiveSparkPlanExec(
       }
 
     case i: InMemoryTableScanLike =>
-      if (i.isMaterialized) {
-        // Cache is already populated. Inline the scan into the parent stage instead of
-        // creating a separate TableCacheQueryStageExec. This matches Spark 3.4 behavior
-        // where InMemoryTableScan is part of the parent exchange stage, preserving exchange
-        // reuse and avoiding extra stages/tasks/bytes.
-        logDebug(s"InMemoryTableScan already materialized, inlining into parent stage")
-        CreateStageResult(
-          newPlan = i,
-          allChildStagesMaterialized = true,
-          newStages = Seq.empty)
-      } else {
-        // Cache not yet populated — need a separate stage to materialize it.
-        // Check the tableCacheStageCache for reuse of an existing stage for the same scan.
-        context.tableCacheStageCache.get(i.canonicalized) match {
-          case Some(existingStage) =>
-            val reuseStage = reuseTableCacheQueryStage(existingStage, i)
-            val isMaterialized = reuseStage.isMaterialized
-            logDebug(s"Reusing table cache query stage ${existingStage.id} " +
-              s"(materialized=$isMaterialized) as new stage ${reuseStage.id}")
-            CreateStageResult(
-              newPlan = reuseStage,
-              allChildStagesMaterialized = isMaterialized,
-              newStages = Seq.empty)
+      // Always wrap InMemoryTableScanLike in a TableCacheQueryStageExec so that
+      // partitioning information from the cached plan is properly propagated
+      // (avoiding unnecessary shuffles) and the stage node is visible in the
+      // plan tree for downstream consumers. Reuse existing stages for the same
+      // scan to avoid duplicate cache reads.
+      //
+      // Important: We must always add a non-materialized stage to newStages so
+      // that it gets submitted for materialization. The stage's isMaterialized
+      // (based on _resultOption) differs from InMemoryTableScan.isMaterialized
+      // (based on cache buffer state). A stage must go through materialize() ->
+      // event -> resultOption.set() to be considered materialized by the AQE
+      // loop, even if the underlying cache is already populated. Without this,
+      // the while loop blocks forever on events.take() with no submitted stages.
+      context.tableCacheStageCache.get(i.canonicalized) match {
+        case Some(existingStage) =>
+          val reuseStage = reuseTableCacheQueryStage(existingStage, i)
+          val isMaterialized = reuseStage.isMaterialized
+          logDebug(s"Reusing table cache query stage ${existingStage.id} " +
+            s"(materialized=$isMaterialized) as new stage ${reuseStage.id}")
+          CreateStageResult(
+            newPlan = reuseStage,
+            allChildStagesMaterialized = isMaterialized,
+            newStages = if (isMaterialized) Seq.empty else Seq(reuseStage))
 
-          case _ =>
-            val newStage = newQueryStage(i).asInstanceOf[TableCacheQueryStageExec]
-            context.tableCacheStageCache.getOrElseUpdate(
-              newStage.plan.canonicalized, newStage)
-            logDebug(s"Created new table cache query stage ${newStage.id}")
-            CreateStageResult(
-              newPlan = newStage,
-              allChildStagesMaterialized = false,
-              newStages = Seq(newStage))
-        }
+        case _ =>
+          val newStage = newQueryStage(i).asInstanceOf[TableCacheQueryStageExec]
+          context.tableCacheStageCache.getOrElseUpdate(
+            newStage.plan.canonicalized, newStage)
+          logDebug(s"Created new table cache query stage ${newStage.id}")
+          CreateStageResult(
+            newPlan = newStage,
+            allChildStagesMaterialized = false,
+            newStages = Seq(newStage))
       }
 
     case q: QueryStageExec =>
